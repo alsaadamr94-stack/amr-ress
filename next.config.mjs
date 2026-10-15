@@ -5,8 +5,9 @@ const csp = [
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "font-src 'self' https://fonts.gstatic.com data:",
   // xlsx library (Excel export) is loaded from cdnjs
-  "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com" + (process.env.NODE_ENV === 'production' ? '' : " 'unsafe-eval'"),
-  "connect-src 'self'",
+  "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://cdnjs.cloudflare.com" + (process.env.NODE_ENV === 'production' ? '' : " 'unsafe-eval'"),
+  "connect-src 'self' blob: data:",
+  "worker-src 'self' blob:",
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "form-action 'self'",
@@ -18,7 +19,15 @@ const nextConfig = {
   async headers() {
     return [
       {
-        source: '/:path*',
+        // the DWG reader (WASM + embind) needs 'unsafe-eval'; it runs in its own Worker with its own, narrower policy
+        source: '/vendor/dwg-worker.js',
+        headers: [
+          { key: 'Content-Security-Policy', value: "default-src 'none'; script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval'; connect-src 'self'" },
+          { key: 'X-Content-Type-Options', value: 'nosniff' },
+        ],
+      },
+      {
+        source: '/:path((?!vendor/dwg-worker\\.js$).*)',
         headers: [
           { key: 'Content-Security-Policy', value: csp },
           { key: 'X-Frame-Options', value: 'DENY' },

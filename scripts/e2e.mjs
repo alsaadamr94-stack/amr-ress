@@ -35,7 +35,7 @@ r = await anon.call('POST', '/auth/login', { username: 'admin', password: 'Admin
 r = await anon.get('/bootstrap'); ok(r.s === 401, 'bootstrap requires login');
 const admin = new Client();
 r = await admin.post('/auth/login', { username: 'admin', password: 'Admin#2026a' }); ok(r.s === 200 && !r.j.must_change, 'admin login');
-r = await admin.get('/bootstrap'); ok(r.s === 200 && r.j.items.length === 21 && r.j.settings.nextSeq === 1, 'bootstrap has 21 library items and counter=1');
+r = await admin.get('/bootstrap'); ok(r.s === 200 && r.j.items.length >= 180 && r.j.items.some(i => i.est && i.std) && r.j.items.filter(i => !i.est).length === 21 && r.j.settings.nextSeq === 1, 'bootstrap has 21 original + std library items (std items flagged est) and counter=1');
 ok(r.j.me.role === 'admin', 'me is admin');
 
 sec('users + roles');
@@ -204,6 +204,232 @@ r = await admin.get('/audit?limit=300'); ok(r.s === 200 && r.j.entries.length > 
 ok(['quote.create', 'receipt.create', 'receipt.void', 'auth.login_failed', 'quote.approval_granted', 'quote.customer_approved', 'user.reset_password'].every(a => r.j.entries.some(e => e.action === a)), 'audit covers key actions');
 dbErr = ''; try { await db.query("delete from audit_log where id = (select min(id) from audit_log)"); } catch (e) { dbErr = e.message; } ok(dbErr.includes('append-only'), 'audit log is append-only');
 
+sec('standard library + takeoff');
+import http from 'node:http';
+let aiCalls = 0, aiLast = null;
+const mock = http.createServer((q, res) => { let b = ''; q.on('data', d => b += d); q.on('end', () => { aiCalls++; aiLast = { headers: q.headers, body: JSON.parse(b) };
+  const aiTxt = (aiLast.body.messages[0].content[1] || aiLast.body.messages[0].content[0]).text; const out = aiTxt.includes('LINES_TEST') ? { content: [{ type: 'text', text: JSON.stringify([{ desc: 'كاشف دخان', qty: 20, unit: 'NO', lib: (/\n([A-Za-z0-9_-]{4,40})\|/.exec(aiTxt) || [])[1] || 'zz', note: '' }, { desc: 'بند غريب', qty: -5, lib: 'invented' }]) }] } : aiTxt.includes('FORCEBAD') ? { content: [{ type: 'text', text: 'not json' }] } : { content: [{ type: 'text', text: 'نتيجة: ' + JSON.stringify({ scale_text: '1:100', legend_found: true, items: [{ var: 'smk', count: 3, points: [[0.1, 0.2], [0.5, 0.5], [2, -1]], confidence: 0.9 }, { var: 'evil', count: 9, points: [] }], warnings: ['w1'] }) }] };
+  res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(out)); }); }).listen(3999);
+r = await admin.post('/items/std'); ok(r.s === 200 && r.j.added === 0, 'std library already seeded at setup (idempotent): ' + r.j.added);
+await db.query("delete from items where data->>'std' in ('fa.smoke.a','ff.pipe.4')");
+r = await sales.c.post('/items/std'); ok(r.s === 403, 'sales cannot import std library');
+r = await admin.post('/items/std'); ok(r.s === 200 && r.j.added === 2 && r.j.items.length >= 180, 'std import re-adds only missing items');
+r = await admin.get('/bootstrap'); const sm = r.j.items.find(i => i.std === 'fa.smoke.a'); ok(sm && sm.est === true && sm.price > 0, 'std item has est flag and price');
+// est flag survives sync + is cleared by editing
+r = await admin.post('/sync', { items: { put: [{ ...sm, price: 321 }] } }); ok(r.s === 200, 'item edit syncs');
+let rr = await admin.get('/bootstrap'); ok(rr.j.items.find(i => i.id === sm.id).price === 321, 'item price updated');
+// takeoff CRUD (fresh sessions: earlier sections revoke some tokens)
+const uA3 = await mk('acc3', 'accountant', 'محاسب 3'); const accT = await login('acc3', uA3.tempPassword); await accT.c.post('/me/password', { current: uA3.tempPassword, password: 'Acc#2026zz' });
+const uS3 = await mk('sales3', 'sales', 'مندوب 3'); const sales3 = await login('sales3', uS3.tempPassword); await sales3.c.post('/me/password', { current: uS3.tempPassword, password: 'Sales#2026z' });
+const TKD = { vars: [{ id: 'smk', name: 'كاشف دخان', kind: 'count', item: sm.id, formula: 'q' }], consts: { waste: 10 }, files: [], sheets: [], marks: [], meas: [], assign: {}, adopt: {}, manual: {} };
+r = await accT.c.get('/takeoffs'); ok(r.s === 403, 'accountant has no take-off access');
+r = await view.c.get('/takeoffs'); ok(r.s === 403 || r.s === 401 || r.s === 429, 'viewer has no take-off access');
+r = await admin.post('/takeoffs', { name: 'حصر المدير', data: TKD }); ok(r.s === 200 && r.j.id && r.j.v === 1, 'admin creates take-off'); const tkA = r.j;
+r = await sales.c.post('/takeoffs', { name: 'حصر المبيعات', data: TKD }); ok(r.s === 200, 'sales creates take-off'); const tkS = r.j;
+r = await sales.c.get('/takeoffs'); ok(r.s === 200 && r.j.takeoffs.length === 1 && r.j.takeoffs[0].id === tkS.id, 'sales sees only own take-offs');
+r = await sales.c.get('/takeoffs/' + tkA.id); ok(r.s === 404, 'sales cannot open others take-off');
+r = await sales3.c.put('/takeoffs/' + tkS.id, { v: 1, data: TKD }); ok(r.s === 404, 'other sales cannot edit it');
+r = await admin.get('/takeoffs'); ok(r.j.takeoffs.length === 2, 'admin sees all take-offs');
+const marks = Array.from({ length: 50 }, (_, i) => ({ id: 'm' + i, sheet: 's1', kind: 'count', var: 'smk', by: 'man', pts: [[i, i]] }));
+r = await admin.put('/takeoffs/' + tkA.id, { v: 1, name: 'حصر معدّل', data: { ...TKD, marks } }); ok(r.s === 200 && r.j.v === 2, 'take-off saved (version 2)');
+r = await admin.put('/takeoffs/' + tkA.id, { v: 1, data: TKD }); ok(r.s === 409 && r.j.code === 'conflict' && r.j.current, 'stale version rejected with 409');
+r = await admin.get('/takeoffs/' + tkA.id); ok(r.j.name === 'حصر معدّل' && r.j.data.marks.length === 50, 'take-off round-trips');
+r = await admin.put('/takeoffs/' + tkA.id, { v: 2, data: { ...TKD, marks: Array.from({ length: 20000 }, (_, i) => ({ id: 'm' + i, sheet: 's1', kind: 'count', var: 'smk', by: 'man', pts: [[i * 1.123456789, i * 2.987654321]], note: 'x'.repeat(40) })) } }); ok(r.s === 400, 'oversized take-off rejected');
+// link to a quote (sales may link only own quotes)
+r = await sales.c.post('/quotes', { quote: { id: 'tkq1', client: 'x', lines: [], date: today, validity: 30, vatRate: 15, status: 'draft', discMode: 'pct', discPct: 0, discAmt: 0, notes: '' }, numbering: 'counter' }); ok(r.s === 200, 'sales quote for linking');
+const qTK = r.j.quote.id;
+r = await sales.c.put('/takeoffs/' + tkS.id, { v: 1, quoteId: qTK }); ok(r.s === 200, 'link take-off to own quote');
+r = await sales.c.put('/takeoffs/' + tkS.id, { v: 2, quoteId: 'doesnotexist' }); ok(r.s === 400, 'link to unknown quote rejected');
+// push-to-quote line fields survive sanitising
+r = await sales.c.post('/sync', { quotes: { put: [{ id: qTK, ...r.j, no: undefined, client: 'x', date: today, validity: 30, vatRate: 15, status: 'draft', discMode: 'pct', discPct: 0, discAmt: 0, notes: '', lines: [{ id: 'l1', lib: sm.id, group: 'g', desc: 'd', brand: '', unit: 'NO', qty: 5, price: 10, est: true, src: 'tk:abcd1234:smk' }], _v: 1 }] } });
+rr = await sales.c.get('/bootstrap'); const ql = rr.j.quotes.find(q => q.id === qTK); ok(ql && ql.lines[0] && ql.lines[0].est === true && ql.lines[0].src === 'tk:abcd1234:smk', 'quote line keeps est + src: ' + JSON.stringify(ql && ql.lines[0]));
+// settings.tk is sanitised
+rr = await admin.get('/bootstrap'); const st0 = rr.j.settings;
+r = await admin.post('/sync', { settings: { ...st0, tk: { consts: { waste: 12, 'bad key!': 3, '9x': 1 }, vars: [{ id: 'smk', name: 'x', kind: 'zzz', item: 'a', formula: 'q*2' }, { id: '', name: 'nope' }], rules: [{ id: 'r1', src: 'block', pat: 'SMOKE*', var: 'smk' }, { id: 'r2', src: 'evil', pat: '', var: 'smk' }] } } }); ok(r.s === 200, 'settings with tk saved');
+rr = await admin.get('/bootstrap'); const tkS2 = rr.j.settings.tk; ok(tkS2 && tkS2.consts.waste === 12 && !('9x' in tkS2.consts) && tkS2.vars.length === 1 && tkS2.vars[0].kind === 'count' && tkS2.rules.length === 1 && tkS2.rules[0].pat === 'SMOKE*', 'settings.tk sanitised: ' + JSON.stringify(tkS2));
+// AI suggestion (mock Anthropic)
+r = await admin.get('/takeoff-ai/status'); ok(r.j.enabled === true, 'AI enabled when key is set');
+const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+r = await sales.c.post('/takeoff-ai', { image: PNG, vars: [{ id: 'smk', name: 'كاشف دخان' }] }); ok(r.s === 200 && r.j.items.length === 1 && r.j.items[0].var === 'smk' && r.j.items[0].points.length === 3, 'AI suggestion parsed and filtered to requested vars');
+ok(r.j.items[0].points.every(p => p[0] >= 0 && p[0] <= 1 && p[1] >= 0 && p[1] <= 1), 'AI points clamped to 0..1');
+ok(aiLast.headers['x-api-key'] === 'test-key' && aiLast.body.messages[0].content[0].type === 'image', 'AI request carries key + image');
+r = await sales.c.post('/takeoff-ai', { image: 'http://evil/x.png', vars: [{ id: 'smk', name: 'x' }] }); ok(r.s === 400, 'AI rejects non-data-URL image');
+r = await sales.c.post('/takeoff-ai', { image: PNG, vars: [] }); ok(r.s === 400, 'AI requires variables');
+r = await sales.c.post('/takeoff-ai', { image: PNG, vars: [{ id: 'smk', name: 'x' }], note: 'FORCEBAD' }); ok(r.s === 502, 'AI garbage reply handled as 502');
+r = await accT.c.post('/takeoff-ai', { image: PNG, vars: [{ id: 'smk', name: 'x' }] }); ok(r.s === 403, 'accountant cannot call AI route');
+r = await sales.c.del ? null : null;
+r = await sales.c.call('DELETE', '/takeoffs/' + tkS.id); ok(r.s === 200, 'owner deletes take-off');
+r = await admin.get('/audit?limit=300'); ok(['takeoff.create', 'takeoff.update', 'takeoff.delete', 'takeoff.ai'].every(a => r.j.entries.some(e => e.action === a)), 'take-off actions audited');
+
+sec('cost visibility, invoices, agreements, templates');
+{
+  const L = (o = {}) => ({ id: 'l' + Math.random().toString(36).slice(2, 7), desc: 'كاشف دخان', unit: 'NO', brand: '', group: 'g', qty: 10, price: 100, cost: 60, ...o });
+  r = await admin.post('/quotes', { quote: baseQ({ client: 'عميل التكلفة', lines: [L()] }), numbering: 'counter' }); const qc = r.j.quote;
+  ok(qc.lines[0].cost === 60, 'admin sees cost');
+  r = await admin.post('/quotes/' + qc.id + '/share'); const tok0 = r.j.quote?._share?.token; ok(!!tok0, 'admin share link created');
+  r = await sales.c.get('/bootstrap'); ok(r.j.me.perms.seeCost === false, 'sales lacks seeCost');
+  r = await acc2.c.get('/bootstrap'); ok(r.j.me.perms.seeCost === true && r.j.quotes.some(q => q.lines?.[0]?.cost === 60), 'accountant sees cost');
+  r = await sales.c.post('/quotes', { quote: baseQ({ client: 'ع', lines: [L({ cost: 1 })] }), numbering: 'counter' }); const qs = r.j.quote;
+  ok(qs.lines[0].cost === undefined, 'sales response has no cost');
+  r = await admin.get('/bootstrap'); ok(r.j.quotes.find(q => q.id === qs.id).lines[0].cost !== 1, "sales cannot inject a cost value");
+  // min margin gate
+  { const c0 = (await admin.get('/bootstrap')).j.settings; r = await admin.post('/sync', { settings: { ...c0, minMarginPct: 50 } }); const s1 = (await admin.get('/bootstrap')).j.settings; ok(s1.minMarginPct === 50, 'min margin setting accepted');
+    await admin.post('/sync', { items: { put: [{ id: 'itcost1', cat: 'قسم', desc: 'صنف بتكلفة', brand: '', unit: 'NO', price: 100, cost: 90 }], del: [] } });
+    const qm = baseQ({ client: 'هامش', lines: [L({ lib: 'itcost1', price: 100, cost: undefined })] }); r = await sales.c.post('/quotes', { quote: qm, numbering: 'counter' }); const qq = r.j.quote;
+    r = await sales.c.post('/sync', { quotes: { put: [{ ...qq, status: 'sent' }], del: [] } }); ok((r.j.warnings || []).some(w => /هامش/.test(w.text)) || (r.j.rejected || []).length > 0, 'margin gate blocks low-margin send for sales');
+    const adm = (await admin.get('/bootstrap')).j.quotes.find(q => q.id === qq.id); ok(adm.lines[0].cost === 90, 'admin cost preserved after sales save');
+    r = await admin.post('/sync', { settings: { ...(await admin.get('/bootstrap')).j.settings, minMarginPct: 0 } }); }
+  // invoices
+  r = await sales.c.get('/invoices'); ok(r.s === 403, 'sales cannot list invoices');
+  r = await acc2.c.post('/invoices', { kind: 'invoice', date: today, buyer: { name: 'شركة س', vat: '300000000000003' }, lines: [{ desc: 'خدمة', qty: 2, price: 100 }] });
+  ok(r.s === 200 && r.j.invoice.total === 230 && r.j.invoice.vat === 30, 'invoice totals computed on server');
+  const inv = r.j.invoice;
+  r = await acc2.c.post('/invoices', { kind: 'invoice', date: today, buyer: { name: 'x', vat: '123' }, lines: [{ desc: 'a', qty: 1, price: 1 }] }); ok(r.s === 400, 'bad buyer VAT rejected');
+  r = await acc2.c.post('/invoices', { kind: 'credit', date: today, refId: inv.id, reason: 'مرتجع', buyer: { name: 'شركة س' }, lines: [{ desc: 'خدمة', qty: 3, price: 100 }] }); ok(r.s === 400, 'credit note above invoice rejected');
+  r = await acc2.c.post('/invoices', { kind: 'credit', date: today, refId: inv.id, buyer: { name: 'شركة س' }, lines: [{ desc: 'خدمة', qty: 1, price: 100 }] }); ok(r.s === 400, 'credit note requires reason');
+  r = await acc2.c.post('/invoices', { kind: 'credit', date: today, refId: inv.id, reason: 'مرتجع', buyer: { name: 'شركة س' }, lines: [{ desc: 'خدمة', qty: 1, price: 100 }] }); ok(r.s === 200, 'valid credit note');
+  let imm = false; try { await db.query(`update invoices set total = 1 where id = $1`, [inv.id]); } catch { imm = true; } ok(imm, 'invoice immutable at DB level');
+  r = await acc2.c.get('/invoices'); ok(r.j.invoices.length === 2, 'invoices listed');
+  // agreements
+  const ag = { kind: 'nda', title: 'اتفاقية سرية', date: today, party2: { name: 'شركة ص' }, clauses: [{ id: 'k1', title: 'السرية', text: 'نص', on: true }], payments: [] };
+  r = await sales.c.post('/agreements', { agreement: ag }); ok(r.s === 200 && /^AG-/.test(r.j.agreement.no), 'sales creates agreement: ' + r.j.agreement?.no);
+  const agS = r.j.agreement;
+  r = await sales3.c.get('/agreements'); ok(r.s === 200 && !r.j.agreements.some(a => a.id === agS.id), 'other sales cannot see it');
+  r = await sales3.c.put('/agreements/' + agS.id, { agreement: ag, _v: agS._v }); ok(r.s === 404 || r.s === 403, 'other sales cannot edit it');
+  r = await acc2.c.post('/agreements', { agreement: ag }); ok(r.s === 403, 'accountant is read-only on agreements');
+  r = await acc2.c.get('/agreements'); ok(r.j.agreements.some(a => a.id === agS.id), 'accountant reads all agreements');
+  r = await sales.c.put('/agreements/' + agS.id, { agreement: { ...ag, title: 'معدلة' }, status: 'signed', _v: agS._v }); ok(r.s === 200 && r.j.agreement._v === agS._v + 1, 'agreement saved & signed');
+  const v2 = r.j.agreement._v;
+  r = await sales.c.put('/agreements/' + agS.id, { agreement: { ...ag, title: 'تعديل بعد التوقيع' }, status: 'signed', _v: v2 }); ok(r.s === 400, 'signed agreement locked');
+  r = await sales.c.put('/agreements/' + agS.id, { agreement: ag, status: 'draft', _v: 1 }); ok(r.s === 409, 'stale agreement version -> 409');
+  r = await sales.c.call('DELETE', '/agreements/' + agS.id); ok(r.s === 403, 'sales cannot delete non-draft agreement');
+  r = await admin.call('DELETE', '/agreements/' + agS.id); ok(r.s === 200, 'admin deletes agreement');
+  // templates
+  const cur = (await admin.get('/bootstrap')).j; const tpl = { id: 't1', name: 'قالب <b>x</b>', theme: { navy: '#112233', evil: 'red;}</style>' }, font: { body: 'cairo', scale: 9 }, bar: 'zzz' };
+  r = await admin.post('/sync', { settings: { ...cur.settings, templates: [tpl], tplDef: { quote: 't1' } } });
+  const s2 = (await admin.get('/bootstrap')).j.settings; const t = (s2.templates || [])[0];
+  ok(t && t.theme.navy === '#112233' && !JSON.stringify(t).includes('</style>'), 'template sanitised (no css injection)');
+  ok(t && t.bar !== 'zzz' && (t.font.scale || 1) <= 1.4, 'template enums & scale clamped');
+  ok(s2.tplDef.quote === 't1', 'default template assigned');
+  r = await sales.c.get('/bootstrap'); ok(r.j.settings.templates?.length === 1, 'sales receives templates');
+  { const tk = String(tok0 || '').split('/').pop(); r = await anon.get('/public/quote/' + tk); ok(r.s === 200 && !JSON.stringify(r.j).includes('"cost"'), 'public quote has no cost'); }
+}
+
+sec('contract cycle: variation orders, IPCs, cheques');
+{
+  const k = { date: today, party2: 'عميل', duration: 30, override: '', items: true, stamp: true, intro: '', terms: '', paynote: '', close: '', payments: [{ id: 'p1', label: 'دفعة', pct: 100, due: '' }] };
+  r = await admin.post('/quotes', { quote: baseQ({ client: 'عميل دورة', lines: [{ id: 'z1', group: 'قسم أ', desc: 'بند', brand: '', unit: 'NO', qty: 10, price: 1000 }, { id: 'z2', group: 'قسم ب', desc: 'بند2', brand: '', unit: 'NO', qty: 10, price: 1000 }], contract: k }), numbering: 'counter', keepContract: true });
+  const qc = r.j.quote; ok(!!qc.contract, 'contract quote created');
+  // variation order
+  r = await acc2.c.post('/pdocs', { kind: 'vo', doc: { quoteId: qc.id, title: 'أعمال إضافية', dir: 'add', vatRate: 15, lines: [{ desc: 'كاشف', unit: 'NO', qty: 4, price: 250 }] } });
+  ok(r.s === 200 && r.j.doc.amount === 1150 && /^VO-/.test(r.j.doc.no), 'VO created with server-side amount: ' + r.j.doc?.amount);
+  const vo = r.j.doc;
+  r = await sales.c.post('/pdocs', { kind: 'vo', doc: { quoteId: qc.id, title: 'x', lines: [{ desc: 'a', qty: 1, price: 1 }] } }); ok(r.s === 403, 'sales cannot create VO');
+  r = await sales.c.get('/pdocs?kind=vo'); ok(r.s === 200 && r.j.docs.length === 0, 'sales sees only VOs of own quotes');
+  r = await acc2.c.put('/pdocs/' + vo.id, { doc: { ...vo, dir: 'omit' }, status: 'approved', _v: vo._v }); ok(r.s === 200 && r.j.doc.status === 'approved' && r.j.doc.amount === -1150, 'VO approved with edits (amount recomputed server-side: omit = negative)');
+  r = await acc2.c.put('/pdocs/' + vo.id, { doc: { ...vo, title: 'تغيير' }, status: 'approved', _v: r.j.doc._v }); ok(r.s === 400, 'approved VO is locked');
+  // IPC chain
+  const il = [{ id: 'g0', desc: 'قسم أ', amt: 10000, pct: 50 }, { id: 'g1', desc: 'قسم ب', amt: 10000, pct: 0 }];
+  r = await acc2.c.post('/pdocs', { kind: 'ipc', doc: { quoteId: qc.id, vatRate: 15, advance: 2000, advPct: 10, retPct: 10, lines: il } });
+  ok(r.s === 200 && r.j.doc.seq === 1 && r.j.doc.calc.work === 5000 && r.j.doc.calc.payable === 4675, 'IPC#1 computed: ' + r.j.doc?.amount);
+  const i1 = r.j.doc;
+  r = await acc2.c.post('/pdocs', { kind: 'ipc', doc: { quoteId: qc.id, vatRate: 15, advance: 2000, advPct: 10, retPct: 10, lines: il.map(l => ({ ...l, pct: 100 })) } }); const i2 = r.j.doc; ok(i2.seq === 2, 'IPC#2 sequence');
+  r = await acc2.c.put('/pdocs/' + i2.id, { doc: i2, status: 'approved', _v: i2._v }); ok(r.s === 400, 'cannot approve IPC#2 before #1');
+  r = await acc2.c.put('/pdocs/' + i1.id, { doc: i1, status: 'approved', _v: i1._v }); ok(r.s === 200 && r.j.doc.status === 'approved', 'IPC#1 approved');
+  r = await acc2.c.put('/pdocs/' + i2.id, { doc: i2, status: 'draft', _v: i2._v }); ok(r.s === 200 && r.j.doc.calc.thisWork === 15000 && r.j.doc.calc.thisAdv === 1500, 'IPC#2 uses #1 as previous: thisWork ' + r.j.doc.calc?.thisWork);
+  ok(r.j.doc.calc.payable === Math.round((15000 - 1500) * 1.15 * 100) / 100 - 1500, 'IPC#2 payable correct: ' + r.j.doc.calc.payable);
+  r = await acc2.c.put('/pdocs/' + i1.id, { doc: { ...i1, retPct: 0 }, status: 'approved', _v: 3 }); ok(r.s === 409 || r.s === 400, 'approved IPC cannot be altered');
+  r = await acc2.c.call('DELETE', '/pdocs/' + i1.id); ok(r.s === 400 || r.s === 403, 'approved IPC cannot be deleted');
+  r = await acc2.c.post('/pdocs', { kind: 'ipc', doc: { quoteId: 'nope', lines: il } }); ok(r.s === 400, 'IPC needs a valid contract');
+  // cheques
+  r = await acc2.c.post('/pdocs', { kind: 'chq', doc: { dir: 'in', party: 'عميل', bank: 'الراجحي', chqNo: '123', amount: 5000, due: today } }); ok(r.s === 200 && r.j.doc.amount === 5000 && /^CHQ-/.test(r.j.doc.no), 'cheque registered');
+  const ch = r.j.doc;
+  r = await sales.c.get('/pdocs?kind=chq'); ok(r.s === 403, 'sales cannot see cheques');
+  r = await acc2.c.put('/pdocs/' + ch.id, { doc: ch, status: 'cleared', _v: ch._v }); ok(r.s === 200 && r.j.doc.status === 'cleared', 'cheque status updated');
+  r = await acc2.c.get('/pdocs?kind=rfq'); ok(r.s === 200, 'accountant can list RFQs (seeCost)');
+  r = await sales.c.get('/pdocs?kind=rfq'); ok(r.s === 403, 'sales cannot see RFQs');
+  r = await admin.get('/pdocs?kind=zzz'); ok(r.s === 400, 'bad kind rejected');
+  r = await admin.get('/audit?limit=300'); ok(['vo.create', 'ipc.status', 'chq.create'].every(a => r.j.entries.some(e => e.action === a)), 'cycle actions audited');
+}
+
+sec('RFQ + loss reasons');
+{
+  const rf = { title: 'أسعار كواشف', lines: [{ id: 'l1', desc: 'كاشف', unit: 'NO', qty: 10 }, { id: 'l2', desc: 'لوحة', unit: 'NO', qty: 1 }], suppliers: [{ id: 's1', name: 'مورد 1' }, { id: 's2', name: 'مورد 2' }], offers: { s1: { l1: 50, l2: 900 }, s2: { l1: 45, l2: -3, zz: 5 }, s9: { l1: 1 } }, chosen: { l1: 's2', l2: 'sX', bad: 's1' } };
+  r = await admin.post('/pdocs', { kind: 'rfq', doc: rf }); ok(r.s === 200 && /^RFQ-/.test(r.j.doc.no), 'RFQ created');
+  const d = r.j.doc;
+  ok(d.offers.s2.l1 === 45 && d.offers.s2.l2 === undefined && d.offers.s2.zz === undefined && !d.offers.s9, 'offers sanitised (negative, unknown line/supplier dropped)');
+  ok(d.chosen.l1 === 's2' && !d.chosen.l2 && !d.chosen.bad, 'chosen sanitised');
+  r = await acc2.c.put('/pdocs/' + d.id, { doc: { ...d, title: 'معدّل' }, status: 'sent', _v: d._v }); ok(r.s === 200 && r.j.doc.status === 'sent', 'accountant edits RFQ');
+  r = await sales.c.post('/pdocs', { kind: 'rfq', doc: rf }); ok(r.s === 403, 'sales cannot create RFQ');
+  r = await admin.get('/bootstrap'); const q0 = r.j.quotes.find(q => q.client === 'عميل دورة');
+  r = await admin.post('/sync', { quotes: { put: [{ ...q0, status: 'lost', lostReason: 'price' }], del: [] } });
+  r = await admin.get('/bootstrap'); ok(r.j.quotes.find(q => q.id === q0.id).lostReason === 'price', 'lost reason saved');
+  const q1 = r.j.quotes.find(q => q.id === q0.id);
+  r = await admin.post('/sync', { quotes: { put: [{ ...q1, lostReason: 'hack<script>' }], del: [] } });
+  r = await admin.get('/bootstrap'); ok(r.j.quotes.find(q => q.id === q0.id).lostReason === '', 'invalid lost reason rejected');
+}
+
+sec('technical attachments');
+{
+  const { PDFDocument } = await import('pdf-lib');
+  const pd = await PDFDocument.create(); pd.addPage([300, 300]); const pdfB64 = Buffer.from(await pd.save()).toString('base64');
+  const item = (await admin.get('/bootstrap')).j.items[0];
+  r = await admin.post('/attachments', { refId: item.id, docType: 'datasheet', name: 'ورقة <b>بيانات</b>', data: 'data:application/pdf;base64,' + pdfB64 });
+  ok(r.s === 200 && r.j.attachment.mime === 'application/pdf' && !r.j.attachment.name.includes('<'), 'PDF attached (name sanitised)');
+  const at = r.j.attachment;
+  r = await admin.post('/attachments', { refId: item.id, name: 'x', data: 'data:application/pdf;base64,' + Buffer.from('<html>evil</html>').toString('base64') }); ok(r.s === 400, 'non-PDF/image content rejected by signature');
+  r = await admin.post('/attachments', { refId: item.id, name: 'x', data: 'data:application/pdf;base64,' + Buffer.alloc(3.2 * 1024 * 1024, 37).toString('base64') }); ok(r.s === 400, 'oversized attachment rejected');
+  r = await sales.c.post('/attachments', { refId: item.id, name: 'x', data: 'data:application/pdf;base64,' + pdfB64 }); ok(r.s === 403, 'sales cannot upload');
+  r = await sales.c.get('/attachments?refId=' + item.id); ok(r.s === 200 && r.j.attachments.length === 1 && !r.j.attachments[0].data, 'sales lists metadata only');
+  r = await sales.c.get('/attachments/' + at.id); ok(r.s === 200 && r.j.data.startsWith('data:application/pdf;base64,'), 'sales downloads attachment');
+  r = await anon.get('/attachments/' + at.id); ok(r.s === 401, 'anonymous cannot download');
+  r = await sales.c.call('DELETE', '/attachments/' + at.id); ok(r.s === 403, 'sales cannot delete');
+  r = await admin.call('DELETE', '/attachments/' + at.id); ok(r.s === 200, 'admin deletes attachment');
+}
+
+sec('follow-up tracking');
+{
+  r = await admin.post('/quotes', { quote: baseQ({ client: 'عميل المتابعة', lines: [{ id: 'f1', group: 'g', desc: 'بند', brand: '', unit: 'NO', qty: 1, price: 100 }] }), numbering: 'counter' }); const qf = r.j.quote;
+  r = await admin.post('/sync', { quotes: { put: [{ ...qf, status: 'sent' }], del: [] } });
+  r = await admin.post('/quotes/' + qf.id + '/share'); const tk = r.j.quote._share.token;
+  r = await admin.get('/bootstrap'); let f = r.j.quotes.find(q => q.id === qf.id); ok(!!f._sentAt && f._views.n === 0, 'sent_at recorded, no views yet');
+  await anon.get('/public/quote/' + tk);
+  r = await anon.call('GET', '/public/quote/' + tk, null, { 'User-Agent': 'WhatsApp/2.23 preview bot' });
+  r = await admin.get('/bootstrap'); f = r.j.quotes.find(q => q.id === qf.id); ok(f._views.n === 1 && !!f._views.first && !!f._views.last, 'customer view counted once, bots ignored: ' + f._views.n);
+  r = await admin.post('/quotes/' + qf.id + '/share'); r = await admin.get('/bootstrap'); f = r.j.quotes.find(q => q.id === qf.id); ok(f._views.n === 0, 'new link resets view counter');
+  r = await sales.c.get('/bootstrap'); ok(r.j.quotes.every(q => q._views !== undefined), 'views exposed with quotes');
+}
+
+sec('AI lines (voice / BOQ text)');
+{
+  r = await sales.c.post('/ai/lines', { text: 'LINES_TEST عشرين كاشف دخان' }); ok(r.s === 200 && r.j.lines.length === 2, 'AI lines parsed');
+  ok(r.j.lines[0].lib && r.j.lines[0].qty === 20, 'first line matched to a real library id');
+  ok(r.j.lines[1].lib === '' && r.j.lines[1].qty === 1, 'invented library id dropped, bad qty fixed');
+  r = await sales.c.post('/ai/lines', { text: 'x' }); ok(r.s === 400, 'too-short text rejected');
+  const vw = await (async () => { const u = await mk('view9', 'viewer', 'مشاهد'); const v = await login('view9', u.tempPassword); await v.c.post('/me/password', { current: u.tempPassword, password: 'View#2026zz' }); return v; })();
+  r = await vw.c.post('/ai/lines', { text: 'LINES_TEST كاشف' }); ok(r.s === 403, 'viewer cannot use AI lines');
+  r = await anon.post('/ai/lines', { text: 'LINES_TEST كاشف' }); ok(r.s === 401, 'anonymous cannot use AI lines');
+}
+
+sec('client portal + approval fingerprint');
+{
+  const cur = (await admin.get('/bootstrap')).j;
+  const k = { date: today, party2: 'عميل', duration: 30, override: '', items: true, stamp: true, intro: '', terms: '', paynote: '', close: '', payments: [{ id: 'pp1', label: 'دفعة أولى', pct: 100, due: '' }] };
+  r = await admin.post('/quotes', { quote: baseQ({ client: 'عميل البوابة', lines: [{ id: 'p1', group: 'g', desc: 'بند', brand: '', unit: 'NO', qty: 1, price: 1000 }], contract: k }), numbering: 'counter', keepContract: true }); const qp = r.j.quote;
+  r = await admin.post('/sync', { quotes: { put: [{ ...qp, status: 'sent' }], del: [] } });
+  r = await admin.post('/quotes/' + qp.id + '/share'); const tk = r.j.quote._share.token;
+  r = await anon.get('/public/quote/' + tk); ok(r.s === 200 && r.j.portal === null, 'portal hidden by default');
+  const sig = 'data:image/png;base64,' + Buffer.alloc(300, 1).toString('base64');
+  r = await anon.post('/public/quote/' + tk, { action: 'approve', name: 'عميل البوابة', signature: sig, v: r.j.v }); ok(r.s === 200, 'customer approves');
+  r = await anon.get('/public/quote/' + tk); ok(/^[0-9a-f]{64}$/.test(r.j.quote._decision.docHash || ''), 'approval carries a SHA-256 document fingerprint');
+  const st2 = (await admin.get('/bootstrap')).j.settings;
+  await admin.post('/sync', { settings: { ...st2, portalOn: true } });
+  r = await anon.get('/public/quote/' + tk); ok(r.j.portal && r.j.portal.base === 1150 && r.j.portal.payments.length === 1 && Array.isArray(r.j.portal.receipts), 'portal shows contract status when enabled');
+  ok(!JSON.stringify(r.j.portal).includes('cost') && !JSON.stringify(r.j.portal).includes('owner'), 'portal exposes no internal fields');
+  await admin.post('/sync', { settings: { ...(await admin.get('/bootstrap')).j.settings, portalOn: false } });
+}
+
+mock.close();
 sec('logout');
 r = await admin.post('/auth/logout'); r = await admin.get('/bootstrap'); ok(r.s === 401, 'logout clears session');
 
