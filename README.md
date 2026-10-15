@@ -50,3 +50,6 @@ npm install
 cp .env.example .env   # عبّئ القيم
 npm run dev
 ```
+
+## استكشاف الأخطاء
+- **فشل البناء: `no such file or directory ... src/shared/rass-doc.js`**: لم يُرفع المجلد `src/shared` إلى GitHub (يحدث أحياناً عند رفع المجلدات بالسحب والإفلات عبر الموقع). تأكد من وجود `src/shared/rass-doc.js` في المستودع، أو ارفع المشروع بـ git من سطر الأوامر (`git add -A && git commit && git push`).
